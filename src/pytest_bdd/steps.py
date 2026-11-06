@@ -38,20 +38,25 @@ def _(article):
 from __future__ import annotations
 
 import enum
+import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from itertools import count
+from sys import _getframe
 from typing import Literal, ParamSpec, TypeVar
 from weakref import WeakKeyDictionary
 
 import pytest
 
+from . import audit
 from .parser import Step
 from .parsers import StepParser, get_parser
 from .utils import get_caller_module_locals
 
 P = ParamSpec("P")
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 step_function_context_registry: WeakKeyDictionary[Callable[..., object], StepFunctionContext] = WeakKeyDictionary()
 
@@ -180,6 +185,32 @@ def step(
             f"{StepNamePrefix.step_def.value}_{type_ or '*'}_{parser.name}", seen=caller_locals.keys()
         )
         caller_locals[fixture_step_name] = pytest.fixture(name=fixture_step_name)(step_function_marker)
+
+        # Versioned audit trail (side channel). Only static metadata is observed:
+        # the step function is never called, converters are never invoked and
+        # parsed test input values are never read. Auditing must never alter the
+        # registration main flow, so every failure is contained here.
+        try:
+            # From within `decorator`, depth 1 is the frame that applies it.
+            caller_frame = _getframe(1)
+        except ValueError:
+            caller_frame = None
+        try:
+            audit.step_registry_audit.record_registration(
+                step_name=parser.name,
+                step_type=type_,
+                parser_name=parser.name,
+                parser_type=type(parser).__name__,
+                target_fixture=target_fixture,
+                converter_count=len(converters),
+                function_name=getattr(func, "__name__", "<unknown>"),
+                frame=caller_frame,
+            )
+        except Exception:
+            logger.debug("Step registry audit failed", exc_info=True)
+        finally:
+            del caller_frame
+
         return func
 
     return decorator
